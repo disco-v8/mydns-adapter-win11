@@ -32,7 +32,7 @@ use winservice::{install_service, restart_service, run_service, uninstall_servic
 #[command(author, version, about = "MyDNS.JP Adapter for Windows", long_about = None)]
 struct Args {
     /// 新しいアカウント設定を追加します。
-    #[arg(long)]
+    #[arg(short, long)]
     add: bool,
 
     /// 既存のアカウント設定を編集します。MasterIDを省略した場合は、対話的に選択します。
@@ -40,7 +40,7 @@ struct Args {
     edit: Option<String>,
 
     /// 指定されたMasterIDのアカウント設定を削除します。
-    #[arg(long)]
+    #[arg(short, long)]
     remove: Option<String>,
 
     /// 現在の設定を一覧表示します。
@@ -72,7 +72,7 @@ struct Args {
     uninstall: bool,
 
     /// Restart the Windows service.
-    #[arg(short, long)]
+    #[arg(long)]
     restart: bool,
 }
 
