@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = "1.24"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+rpassword = "7.4"
+reqwest = { version = "0.12", features = ["blocking"] }
+windows = { version = "0.58", features = ["Win32_System_Registry", "Win32_Foundation", "Win32_Security", "Win32_System_Services", "Win32_System_SystemInformation", "Win32_Globalization"] }
+windows-service = "0.7"
