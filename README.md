@@ -15,7 +15,13 @@ MyDNS.JPに対して定期的にIPアドレス通知します。
 
 ## クイックスタート
 
-### 1. ビルド
+### A. EXEをサクッとダウンロード
+
+最新版のEXEをダウンロードしてください
+
+### B. Rustのソースコードからビルド
+
+#### B-1. ビルド
 
 Rustのツールチェインが必要です。以下のコマンドでリリースビルドを行います。
 
@@ -23,7 +29,7 @@ Rustのツールチェインが必要です。以下のコマンドでリリー�
 cargo build --release
 ```
 
-### 2. アカウントの追加
+#### B-2. アカウントの追加
 
 まず、通知したいMyDNS.JPのアカウント情報を登録します。
 
@@ -32,7 +38,7 @@ cargo build --release
 .\target\release\mydns-adapter-win11.exe --add
 ```
 
-### 3. Windowsサービスとしてインストール
+### Windowsサービスとしてインストール
 
 ビルドして生成された `target\release\mydns-adapter-win11.exe` 、もしくはReleaseからダウンロードした実行形式ファイル `mydns-adapter-win11.exe` を、`C:\MyDNS-Adapter\` のような任意の永続的なディレクトリにコピーします。
 
