@@ -92,7 +92,7 @@ fn get_msg_lang(key: &str, is_jp: bool) -> &str {
         "service_uninstalled_fmt" => if is_jp { "サービス '{}' が正常にアンインストールされました。" } else { "Service '{}' uninstalled successfully." },
         "log_service_failed_fmt" => if is_jp { "サービスの実行に失敗しました: {}" } else { "Service failed to run: {}" },
         "log_service_started" => if is_jp { "サービスを開始しました。" } else { "Service started." },
-        "log_service_config_missing" => if is_jp { "MasterIDまたはパスワードが設定されていません。サービスを停止します。" } else { "MasterID or Password is not set. Service will stop." },
+        "log_service_config_missing" => if is_jp { "通知設定がありません。次回の通知周期に再確認します。" } else { "No notification configuration is available. It will be checked again next cycle." },
         "log_service_stopping" => if is_jp { "サービスを停止します。" } else { "Service stopping." },
         "admin_required_restart" => if is_jp { "サービスの再起動には管理者権限が必要です。管理者として実行してください。" } else { "Administrator privileges are required to restart the service. Please run as administrator." },
         "service_restarted_successfully" => if is_jp { "サービスを再起動しました。" } else { "Service restarted successfully." },
