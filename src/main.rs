@@ -11,6 +11,8 @@ use std::io::{self, Write};
 
 use clap::Parser;
 use rpassword::read_password;
+use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+use windows::core::HRESULT;
 
 // --- アプリケーションの各機能を実装したモジュール群 ---
 mod i18n;
@@ -25,6 +27,17 @@ use logging::{log_error, log_info};
 use notify::notify_now_mode;
 use registry::{delete_config, load_all_configs, save_to_registry};
 use winservice::{install_service, restart_service, run_service, uninstall_service};
+
+pub(crate) fn registry_load_error(error: windows::core::Error) -> io::Error {
+    if error.code().0 == HRESULT::from(ERROR_ACCESS_DENIED).0 {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Registry access denied. Run MyDNS Adapter CLI from an elevated administrator terminal.",
+        )
+    } else {
+        io::Error::other(error)
+    }
+}
 
 /// clapクレートを利用してコマンドライン引数を定義する構造体。
 /// 各フィールドが、アプリケーションが受け付けるコマンドラインオプションに対応します。
@@ -143,7 +156,7 @@ fn add_mode() -> io::Result<()> {
     let master_id = ask_with_default(get_msg("master_id_prompt"), "", false)?;
 
     // 重複チェック
-    let configs = load_all_configs().unwrap_or_else(|_| Vec::new());
+    let configs = load_all_configs().map_err(registry_load_error)?;
     if configs.iter().any(|c| c.master_id == master_id) {
         println!(
             "{}",
@@ -152,8 +165,8 @@ fn add_mode() -> io::Result<()> {
         return Ok(());
     }
 
-    // MasterIDの基本的な形式を検証します。
-    if !master_id.starts_with("mydns") {
+    // MyDNS MasterID is the lowercase prefix followed by six ASCII digits.
+    if !is_valid_master_id(&master_id) {
         println!("{}", get_msg("invalid_master_id_prefix"));
         return Ok(());
     }
@@ -173,9 +186,11 @@ fn add_mode() -> io::Result<()> {
             log_info(&format!("Account added: {}", master_id));
         }
         Err(e) => {
+            let e = registry_load_error(e);
             let msg = get_msg("registry_save_fail_fmt").replace("{}", &e.to_string());
             println!("{}", msg);
             log_error(&format!("Failed to add account {}: {}", master_id, e));
+            return Err(e);
         }
     }
 
@@ -187,7 +202,7 @@ fn add_mode() -> io::Result<()> {
 fn edit_mode(target_id: Option<String>) -> io::Result<()> {
     println!("{}", get_msg("edit_title"));
 
-    let configs = load_all_configs().unwrap_or_else(|_| Vec::new());
+    let configs = load_all_configs().map_err(registry_load_error)?;
     if configs.is_empty() {
         // 設定が一つもない場合は、新規追加モードに移行するか確認します。
         if ask_yes_no(get_msg("no_accounts_add_prompt"), true)? {
@@ -262,12 +277,14 @@ fn edit_mode(target_id: Option<String>) -> io::Result<()> {
             log_info(&format!("Account edited: {}", config_to_edit.master_id));
         }
         Err(e) => {
+            let e = registry_load_error(e);
             let msg = get_msg("registry_save_fail_fmt").replace("{}", &e.to_string());
             println!("{}", msg);
             log_error(&format!(
                 "Failed to edit account {}: {}",
                 config_to_edit.master_id, e
             ));
+            return Err(e);
         }
     }
 
@@ -287,9 +304,11 @@ fn remove_mode(id: &str) -> io::Result<()> {
                 log_info(&format!("Account removed: {}", id));
             }
             Err(e) => {
+                let e = registry_load_error(e);
                 let msg = get_msg("remove_fail_fmt").replace("{}", &e.to_string());
                 println!("{}", msg);
                 log_error(&format!("Failed to remove account {}: {}", id, e));
+                return Err(e);
             }
         }
     } else {
@@ -340,35 +359,30 @@ fn ask_with_default(prompt: &str, default: &str, is_password: bool) -> io::Resul
         buffer
     };
 
+    Ok(resolve_input(&input, default))
+}
+
+fn resolve_input(input: &str, default: &str) -> String {
     let trimmed = input.trim();
-    // 入力が空であればデフォルト値を、そうでなければ入力された値を返します。
     if trimmed.is_empty() {
-        Ok(default.to_string())
+        default.to_string()
     } else {
-        Ok(trimmed.to_string())
+        trimmed.to_string()
     }
+}
+
+fn is_valid_master_id(master_id: &str) -> bool {
+    let bytes = master_id.as_bytes();
+    bytes.len() == 11 && &bytes[..5] == b"mydns" && bytes[5..].iter().all(u8::is_ascii_digit)
 }
 
 /// パスワード文字列を、コンソール表示用にマスクします。
 /// 機密情報が画面に平文で表示されるのを防ぎます。
 fn mask_password(pw: &str) -> String {
-    let len = pw.chars().count();
-    if len == 0 {
+    if pw.is_empty() {
         return get_msg("not_set").to_string();
     }
-    // 短すぎるパスワードは、文字数すら推測されないように全てマスクします。
-    if len <= 4 {
-        return "*".repeat(len);
-    }
-
-    let mut chars: Vec<char> = pw.chars().collect();
-    // ユーザーがパスワードが設定されていることを認識できるよう、最初・真ん中・最後の文字だけ表示します。
-    for (i, c) in chars.iter_mut().enumerate() {
-        if i != 0 && i != len - 1 && i != len / 2 {
-            *c = '*';
-        }
-    }
-    chars.into_iter().collect()
+    "********".to_string()
 }
 
 /// Yes/No形式の質問をユーザーに問いかけ、現在の設定値も表示します。
@@ -445,7 +459,7 @@ fn ask_yes_no_simple(prompt: &str, default: bool) -> io::Result<bool> {
 /// 設定されているすべてのアカウント情報を、整形されたリストとして表示します。
 fn view_mode() -> io::Result<()> {
     println!("{}", get_msg("view_title"));
-    let configs = load_all_configs().unwrap_or_else(|_| Vec::new());
+    let configs = load_all_configs().map_err(registry_load_error)?;
 
     if configs.is_empty() {
         println!("{}", get_msg("view_no_accounts"));
@@ -485,4 +499,118 @@ fn view_mode() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod p2_tests {
+    use super::{Args, is_valid_master_id, mask_password, registry_load_error, resolve_input};
+    use crate::i18n::get_msg;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn existing_cli_options_and_short_forms_are_preserved() {
+        Args::command().debug_assert();
+        for option in [
+            "--add",
+            "-a",
+            "--edit",
+            "-e",
+            "--view",
+            "-v",
+            "--list",
+            "-l",
+            "--notify",
+            "-n",
+            "--ipv4",
+            "-4",
+            "--ipv6",
+            "-6",
+            "--install",
+            "--uninstall",
+            "--restart",
+        ] {
+            assert!(
+                Args::try_parse_from(["adapter", option]).is_ok(),
+                "option={option}"
+            );
+        }
+        for option in ["--remove", "-r"] {
+            assert_eq!(
+                Args::try_parse_from(["adapter", option, "mydns-fixture"])
+                    .unwrap()
+                    .remove
+                    .as_deref(),
+                Some("mydns-fixture")
+            );
+        }
+        assert_eq!(
+            Args::try_parse_from(["adapter", "--edit"])
+                .unwrap()
+                .edit
+                .as_deref(),
+            Some("_INTERACTIVE_")
+        );
+        assert_eq!(
+            Args::try_parse_from(["adapter", "--edit", "mydns-fixture"])
+                .unwrap()
+                .edit
+                .as_deref(),
+            Some("mydns-fixture")
+        );
+        let both = Args::try_parse_from(["adapter", "-4", "-6"]).unwrap();
+        assert!(both.ipv4 && both.ipv6);
+    }
+
+    #[test]
+    fn new_master_id_must_match_mydns_prefix_and_six_ascii_digits() {
+        assert!(is_valid_master_id("mydns123456"));
+        for invalid in [
+            "mydns-p2boot-validation",
+            "mydns12345",
+            "mydns1234567",
+            "MyDNS123456",
+            "mydns１２３４５６",
+            "mydns12345a",
+        ] {
+            assert!(
+                !is_valid_master_id(invalid),
+                "accepted invalid ID: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_mask_is_fixed_length_and_value_independent() {
+        let short = mask_password("x");
+        let long = mask_password("a-much-longer-secret");
+
+        assert_eq!(short, "********");
+        assert_eq!(long, short);
+        assert_eq!(mask_password(""), get_msg("not_set"));
+    }
+
+    #[test]
+    fn blank_edit_input_preserves_existing_password() {
+        assert_eq!(resolve_input("\r\n", "existing-secret"), "existing-secret");
+        assert_eq!(
+            resolve_input("new-secret\n", "existing-secret"),
+            "new-secret"
+        );
+    }
+
+    #[test]
+    fn registry_access_denied_explains_administrator_requirement() {
+        let error = windows::core::Error::new(
+            windows::core::HRESULT::from(windows::Win32::Foundation::ERROR_ACCESS_DENIED),
+            "access denied",
+        );
+        let mapped = registry_load_error(error);
+
+        assert_eq!(mapped.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            mapped
+                .to_string()
+                .contains("elevated administrator terminal")
+        );
+    }
 }

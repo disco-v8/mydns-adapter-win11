@@ -10,13 +10,17 @@
 use crate::i18n::get_msg_en;
 use crate::logging::{log_error, log_info};
 use crate::registry::{Config, load_all_configs};
+use crate::registry_load_error;
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
 
 pub const NOTIFICATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const NOTIFICATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+const SUCCESS_PHRASE: [&str; 6] = ["login", "and", "ip", "address", "notify", "ok"];
 
 pub fn next_notification_at(cycle_started: Instant) -> Instant {
     cycle_started + NOTIFICATION_INTERVAL
@@ -37,6 +41,34 @@ struct NotificationPlan<'a> {
     use_ipv6: bool,
     endpoints: [&'a str; 2],
     deadline: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NotificationError {
+    Authentication(StatusCode),
+    Server(StatusCode),
+    Http(StatusCode),
+    UnexpectedBody(StatusCode),
+    Communication(&'static str),
+}
+
+impl fmt::Display for NotificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authentication(status) => {
+                write!(formatter, "authentication failed (HTTP {status})")
+            }
+            Self::Server(status) => write!(formatter, "MyDNS.JP server error (HTTP {status})"),
+            Self::Http(status) => write!(formatter, "HTTP request rejected (HTTP {status})"),
+            Self::UnexpectedBody(status) => {
+                write!(
+                    formatter,
+                    "unrecognized notification response (HTTP {status})"
+                )
+            }
+            Self::Communication(reason) => write!(formatter, "communication error ({reason})"),
+        }
+    }
 }
 
 impl NotificationReport {
@@ -67,14 +99,35 @@ impl NotificationReport {
 /// * `use_ipv4` - `--notify` または `--ipv4` が指定された場合に `true`。
 /// * `use_ipv6` - `--notify` または `--ipv6` が指定された場合に `true`。
 pub fn notify_now_mode(use_ipv4: bool, use_ipv6: bool) -> io::Result<()> {
+    run_immediate_notification(load_all_configs, |configs| {
+        let client = build_client()
+            .map_err(|error| io::Error::other(format!("Failed to create HTTP client: {error}")))?;
+        Ok(notify_configs(
+            &client,
+            configs,
+            use_ipv4,
+            use_ipv6,
+            Instant::now() + NOTIFICATION_CYCLE_TIMEOUT,
+            || false,
+        ))
+    })
+}
+
+fn run_immediate_notification<Load, Send>(load_configs: Load, send: Send) -> io::Result<()>
+where
+    Load: FnOnce() -> windows::core::Result<Vec<Config>>,
+    Send: FnOnce(&[Config]) -> io::Result<NotificationReport>,
+{
     log_info(get_msg_en("log_notify_start"));
-    let configs = load_all_configs().map_err(|error| {
+    let configs = load_configs().map_err(|error| {
+        let error = registry_load_error(error);
         log_error(&format!(
             "Failed to load notification configuration: {error}"
         ));
-        io::Error::other(format!(
-            "Failed to load notification configuration: {error}"
-        ))
+        io::Error::new(
+            error.kind(),
+            format!("Failed to load notification configuration: {error}"),
+        )
     })?;
     if configs.is_empty() {
         log_error(get_msg_en("log_config_missing"));
@@ -84,16 +137,7 @@ pub fn notify_now_mode(use_ipv4: bool, use_ipv6: bool) -> io::Result<()> {
         ));
     }
 
-    let client = build_client()
-        .map_err(|error| io::Error::other(format!("Failed to create HTTP client: {error}")))?;
-    let report = notify_configs(
-        &client,
-        &configs,
-        use_ipv4,
-        use_ipv6,
-        Instant::now() + NOTIFICATION_CYCLE_TIMEOUT,
-        || false,
-    );
+    let report = send(&configs)?;
 
     if report.is_success() {
         log_info(get_msg_en("log_notify_finish"));
@@ -157,7 +201,7 @@ fn notify_configs_with_endpoints<F, S>(
 ) -> NotificationReport
 where
     F: Fn() -> bool,
-    S: FnMut(&Client, &str, &str, &str, Duration) -> reqwest::Result<()>,
+    S: FnMut(&Client, &str, &str, &str, Duration) -> Result<(), NotificationError>,
 {
     let mut report = NotificationReport::default();
     for config in configs {
@@ -185,7 +229,7 @@ fn perform_notification<F>(
     endpoints: [&str; 2],
     deadline: Instant,
     should_stop: &F,
-    send_request: &mut impl FnMut(&Client, &str, &str, &str, Duration) -> reqwest::Result<()>,
+    send_request: &mut impl FnMut(&Client, &str, &str, &str, Duration) -> Result<(), NotificationError>,
 ) -> NotificationReport
 where
     F: Fn() -> bool,
@@ -243,37 +287,122 @@ fn notify(
     id: &str,
     pw: &str,
     timeout: Duration,
-) -> reqwest::Result<()> {
+) -> Result<(), NotificationError> {
     // Basic認証情報を付与してGETリクエストを送信します。
     let res = client
         .get(url)
         .basic_auth(id, Some(pw))
         .timeout(timeout)
-        .send()?;
+        .send()
+        .map_err(classify_communication_error)?;
     let status = res.status();
-    // HTTPステータスコードが2xx台（成功）かどうかをチェックします。
-    if status.is_success() {
-        let msg = get_msg_en("log_notify_status_fmt")
-            .replacen("{}", url, 1)
-            .replacen("{}", &status.to_string(), 1);
-        log_info(&format!("[{}] {}", id, msg));
-        Ok(())
+    if !status.is_success() {
+        return Err(
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                NotificationError::Authentication(status)
+            } else if status.is_server_error() {
+                NotificationError::Server(status)
+            } else {
+                NotificationError::Http(status)
+            },
+        );
+    }
+
+    let final_url = res.url().clone();
+    let peer = res
+        .remote_addr()
+        .map_or_else(|| "unknown".to_string(), |address| address.ip().to_string());
+    let body = res.text().map_err(classify_communication_error)?;
+    if !has_success_marker(&body) {
+        log_error(&format!(
+            "[{}] {}",
+            id,
+            describe_unexpected_response(url, &final_url, &peer, status, body.len())
+        ));
+        return Err(NotificationError::UnexpectedBody(status));
+    }
+
+    let msg = get_msg_en("log_notify_status_fmt")
+        .replacen("{}", url, 1)
+        .replacen("{}", &status.to_string(), 1);
+    log_info(&format!("[{}] {}", id, msg));
+    Ok(())
+}
+
+/// 本文・認証情報・クエリを含まない、想定外応答の診断行を作成します。
+fn describe_unexpected_response(
+    requested: &str,
+    final_url: &reqwest::Url,
+    peer: &str,
+    status: StatusCode,
+    body_bytes: usize,
+) -> String {
+    let final_text = format!(
+        "{}://{}{}",
+        final_url.scheme(),
+        final_url.host_str().unwrap_or("?"),
+        final_url.path()
+    );
+    format!(
+        "Unrecognized response diagnostic: requested={requested} final={final_text} same_url={} peer={peer} status={} body_bytes={body_bytes}",
+        final_text == requested,
+        status.as_u16()
+    )
+}
+
+fn has_success_marker(body: &str) -> bool {
+    let tokens = body
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if tokens.iter().any(|token| is_negation(token)) {
+        return false;
+    }
+
+    let phrase_match = tokens
+        .windows(SUCCESS_PHRASE.len())
+        .any(|found| found.iter().map(String::as_str).eq(SUCCESS_PHRASE));
+    let status_tokens = body
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '.' | '+' | '-' | '/')
+        })
+        .filter(|token| !token.is_empty())
+        .map(|token| token.trim_end_matches('.').to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let status_match = status_tokens
+        .windows(3)
+        .any(|found| found[0] == "login" && found[1] == "status" && found[2] == "1");
+
+    phrase_match || status_match
+}
+
+fn is_negation(token: &str) -> bool {
+    matches!(
+        token,
+        "not" | "no" | "failed" | "failure" | "error" | "invalid" | "denied"
+    )
+}
+
+fn classify_communication_error(error: reqwest::Error) -> NotificationError {
+    if error.is_timeout() {
+        NotificationError::Communication("timeout")
+    } else if error.is_connect() {
+        NotificationError::Communication("connection failed")
     } else {
-        // ステータスが成功でない場合（401認証エラー、500サーバーエラーなど）、
-        // `error_for_status()`はレスポンスを`Err`に変換します。
-        // `is_success()`が`false`なので、`unwrap_err()`は常に安全です。
-        Err(res.error_for_status().unwrap_err())
+        NotificationError::Communication("request or response read failed")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NOTIFICATION_INTERVAL, NotificationPlan, NotificationReport, next_notification_at, notify,
-        notify_configs, notify_configs_with_endpoints,
+        NOTIFICATION_INTERVAL, NotificationError, NotificationPlan, NotificationReport,
+        has_success_marker, next_notification_at, notify, notify_configs,
+        notify_configs_with_endpoints, run_immediate_notification,
     };
     use crate::registry::Config;
-    use reqwest::blocking::Client;
+    use reqwest::{StatusCode, blocking::Client};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -282,9 +411,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    fn mock_server(response: &'static str, delay: Duration) -> (String, thread::JoinHandle<()>) {
+    fn mock_server(
+        response: impl Into<String> + Send + 'static,
+        delay: Duration,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let response = response.into();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 1024];
@@ -298,11 +431,12 @@ mod tests {
     }
 
     fn delayed_mock_server(
-        response: &'static str,
+        response: impl Into<String> + Send + 'static,
         delay: Duration,
     ) -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let response = response.into();
         let (request_received_tx, request_received_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -313,6 +447,13 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (format!("http://{address}/"), request_received_rx, server)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
     }
 
     #[test]
@@ -344,9 +485,211 @@ mod tests {
     }
 
     #[test]
+    fn immediate_notification_distinguishes_empty_denied_and_failed_loads() {
+        let empty =
+            run_immediate_notification(|| Ok(vec![]), |_| panic!("must not send")).unwrap_err();
+        assert_eq!(empty.kind(), std::io::ErrorKind::NotFound);
+        for (code, expected_kind) in [
+            (
+                windows::Win32::Foundation::ERROR_ACCESS_DENIED,
+                std::io::ErrorKind::PermissionDenied,
+            ),
+            (
+                windows::Win32::Foundation::ERROR_INVALID_DATA,
+                std::io::ErrorKind::Other,
+            ),
+        ] {
+            let error = run_immediate_notification(
+                || Err(windows::core::Error::from_hresult(code.into())),
+                |_| panic!("must not send"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), expected_kind);
+            assert!(error.to_string().contains("Failed to load"));
+            if expected_kind == std::io::ErrorKind::PermissionDenied {
+                assert!(error.to_string().contains("elevated administrator"));
+            }
+        }
+    }
+
+    #[test]
+    fn immediate_result_fails_for_partial_total_or_zero_notifications() {
+        for (attempted, succeeded, failed, success) in [
+            (2, 2, 0, true),
+            (2, 1, 1, false),
+            (2, 0, 2, false),
+            (0, 0, 0, false),
+        ] {
+            let result = run_immediate_notification(
+                || Ok(vec![Config::default()]),
+                |_| {
+                    Ok(NotificationReport {
+                        attempted,
+                        succeeded,
+                        failed,
+                        ..NotificationReport::default()
+                    })
+                },
+            );
+            assert_eq!(result.is_ok(), success);
+        }
+    }
+
+    #[test]
+    fn protocol_selection_intersects_account_flags_and_continues_after_failure() {
+        let configs = [
+            Config {
+                master_id: "mydns-first".into(),
+                ipv4_notify: true,
+                ipv6_notify: false,
+                ..Config::default()
+            },
+            Config {
+                master_id: "mydns-second".into(),
+                ipv4_notify: true,
+                ipv6_notify: true,
+                ..Config::default()
+            },
+        ];
+        for (use_ipv4, use_ipv6, expected) in [
+            (
+                true,
+                false,
+                vec![("mydns-first", "v4"), ("mydns-second", "v4")],
+            ),
+            (false, true, vec![("mydns-second", "v6")]),
+            (
+                true,
+                true,
+                vec![
+                    ("mydns-first", "v4"),
+                    ("mydns-second", "v4"),
+                    ("mydns-second", "v6"),
+                ],
+            ),
+        ] {
+            let mut observed = vec![];
+            let report = notify_configs_with_endpoints(
+                &Client::new(),
+                &configs,
+                NotificationPlan {
+                    use_ipv4,
+                    use_ipv6,
+                    endpoints: ["v4", "v6"],
+                    deadline: Instant::now() + Duration::from_secs(2),
+                },
+                || false,
+                |_, url, id, _, _| {
+                    observed.push((id.to_string(), url.to_string()));
+                    if id == "mydns-first" {
+                        Err(NotificationError::Authentication(StatusCode::UNAUTHORIZED))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(
+                observed,
+                expected
+                    .into_iter()
+                    .map(|(id, url)| (id.to_string(), url.to_string()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(report.attempted, observed.len());
+            assert_eq!(report.failed, usize::from(use_ipv4));
+            assert_eq!(report.succeeded, observed.len() - report.failed);
+        }
+    }
+
+    fn capturing_server(
+        response: String,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let length = stream.read(&mut request).unwrap_or(0);
+            tx.send(String::from_utf8_lossy(&request[..length]).into_owned())
+                .unwrap();
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{address}/"), rx, server)
+    }
+
+    fn authorization_header(request: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    #[test]
+    fn notification_request_carries_basic_authorization_header() {
+        let (url, request, server) =
+            capturing_server(http_response("200 OK", "Login and IP address notify OK."));
+
+        notify(
+            &Client::new(),
+            &url,
+            "mydns-test",
+            "test-password",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        // "mydns-test:test-password" をBase64化した固定値(ダミー資格情報)。
+        assert_eq!(
+            authorization_header(&request.recv().unwrap()).as_deref(),
+            Some("Basic bXlkbnMtdGVzdDp0ZXN0LXBhc3N3b3Jk")
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_does_not_forward_basic_authorization() {
+        let (target_url, target_request, target) =
+            capturing_server(http_response("200 OK", "Login and IP address notify OK."));
+        let (url, first_request, first) = capturing_server(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+
+        let _ = notify(
+            &Client::new(),
+            &url,
+            "mydns-test",
+            "test-password",
+            Duration::from_secs(2),
+        );
+        first.join().unwrap();
+        target.join().unwrap();
+
+        assert!(authorization_header(&first_request.recv().unwrap()).is_some());
+        assert_eq!(authorization_header(&target_request.recv().unwrap()), None);
+    }
+
+    #[test]
+    fn unexpected_response_diagnostic_excludes_query_and_credentials() {
+        let final_url =
+            reqwest::Url::parse("https://user:secret@www.mydns.jp/help?token=abc").unwrap();
+        let line = super::describe_unexpected_response(
+            "https://ipv4.mydns.jp/login.html",
+            &final_url,
+            "192.0.2.1",
+            StatusCode::OK,
+            42,
+        );
+        assert!(line.contains("final=https://www.mydns.jp/help same_url=false"));
+        assert!(line.contains("body_bytes=42"));
+        assert!(!line.contains("secret") && !line.contains("token"));
+    }
+
+    #[test]
     fn http_success_is_accepted() {
         let (url, server) = mock_server(
-            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            http_response("200 OK", "Login and IP address notify OK."),
             Duration::ZERO,
         );
 
@@ -364,21 +707,177 @@ mod tests {
     }
 
     #[test]
-    fn http_error_is_reported_as_failure() {
-        let (url, server) = mock_server(
-            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    fn ipv4_phrase_and_ipv6_status_are_independently_accepted() {
+        let (ipv4_url, ipv4_server) = mock_server(
+            http_response("200 OK", "Login and IP address notify OK."),
             Duration::ZERO,
         );
+        let (ipv6_url, ipv6_server) =
+            mock_server(http_response("200 OK", "login_status = 1"), Duration::ZERO);
+        let config = Config {
+            master_id: "mydns-test".to_string(),
+            password: "test-password".to_string(),
+            ipv4_notify: true,
+            ipv6_notify: true,
+        };
 
-        assert!(
+        let report = notify_configs_with_endpoints(
+            &Client::new(),
+            &[config],
+            NotificationPlan {
+                use_ipv4: true,
+                use_ipv6: true,
+                endpoints: [&ipv4_url, &ipv6_url],
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+            || false,
+            notify,
+        );
+
+        ipv4_server.join().unwrap();
+        ipv6_server.join().unwrap();
+        assert_eq!(report.attempted, 2);
+        assert!(report.is_success());
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_ng_bodies_are_both_rejected() {
+        let (ipv4_url, ipv4_server) =
+            mock_server(http_response("200 OK", "Login failed."), Duration::ZERO);
+        let (ipv6_url, ipv6_server) =
+            mock_server(http_response("200 OK", "login status=10"), Duration::ZERO);
+        let config = Config {
+            master_id: "mydns-test".to_string(),
+            password: "test-password".to_string(),
+            ipv4_notify: true,
+            ipv6_notify: true,
+        };
+
+        let report = notify_configs_with_endpoints(
+            &Client::new(),
+            &[config],
+            NotificationPlan {
+                use_ipv4: true,
+                use_ipv6: true,
+                endpoints: [&ipv4_url, &ipv6_url],
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+            || false,
+            notify,
+        );
+
+        ipv4_server.join().unwrap();
+        ipv6_server.join().unwrap();
+        assert_eq!(report.failed, 2);
+        assert_eq!(report.succeeded, 0);
+        assert!(!report.is_success());
+    }
+
+    #[test]
+    fn official_success_markers_are_or_conditions_with_tolerant_formatting() {
+        assert!(has_success_marker("Login and IP address notify OK"));
+        assert!(has_success_marker("LOGIN\tAND, IP-address notify OK."));
+        assert!(has_success_marker("login status=1"));
+        assert!(has_success_marker("LOGIN_STATUS = 1"));
+        assert!(!has_success_marker("not Login and IP address notify OK."));
+        assert!(!has_success_marker("login status=10"));
+        assert!(!has_success_marker("login failed; status=1"));
+    }
+
+    #[test]
+    fn login_status_requires_exact_unsigned_one() {
+        for value in ["-1", "+1", "1.5", "1/2", "10", "0", "1abc"] {
+            assert!(
+                !has_success_marker(&format!("login status={value}")),
+                "value={value}"
+            );
+        }
+        assert!(has_success_marker("login_status = 1."));
+        assert!(has_success_marker("<p>login status=1</p>"));
+    }
+
+    #[test]
+    fn http_error_is_reported_as_failure() {
+        let body = "Login failed; secret response details.";
+        let (url, server) = mock_server(http_response("401 Unauthorized", body), Duration::ZERO);
+
+        let error = notify(
+            &Client::new(),
+            &url,
+            "mydns-test",
+            "test-password",
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            NotificationError::Authentication(StatusCode::UNAUTHORIZED)
+        );
+        let message = error.to_string();
+        assert!(!message.contains(body));
+        assert!(!message.contains("test-password"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn successful_http_status_without_either_success_marker_is_rejected() {
+        let (url, server) =
+            mock_server(http_response("200 OK", "ordinary response"), Duration::ZERO);
+
+        assert_eq!(
             notify(
                 &Client::new(),
                 &url,
                 "mydns-test",
                 "test-password",
                 Duration::from_secs(2)
-            )
-            .is_err()
+            ),
+            Err(NotificationError::UnexpectedBody(StatusCode::OK))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn server_error_is_distinguished_from_authentication_error() {
+        for (status, expected) in [
+            (
+                "500 Internal Server Error",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            ("503 Service Unavailable", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let (url, server) = mock_server(http_response(status, ""), Duration::ZERO);
+
+            assert_eq!(
+                notify(
+                    &Client::new(),
+                    &url,
+                    "mydns-test",
+                    "test-password",
+                    Duration::from_secs(2)
+                ),
+                Err(NotificationError::Server(expected))
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn other_http_errors_are_distinguished_from_authentication_errors() {
+        let (url, server) = mock_server(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            Duration::ZERO,
+        );
+
+        assert_eq!(
+            notify(
+                &Client::new(),
+                &url,
+                "mydns-test",
+                "test-password",
+                Duration::from_secs(2)
+            ),
+            Err(NotificationError::Http(StatusCode::BAD_REQUEST))
         );
         server.join().unwrap();
     }
@@ -390,15 +889,15 @@ mod tests {
             Duration::from_millis(300),
         );
 
-        assert!(
+        assert_eq!(
             notify(
                 &Client::new(),
                 &url,
                 "mydns-test",
                 "test-password",
                 Duration::from_millis(50)
-            )
-            .is_err()
+            ),
+            Err(NotificationError::Communication("timeout"))
         );
         server.join().unwrap();
     }
@@ -426,10 +925,9 @@ mod tests {
 
     #[test]
     fn stop_after_one_request_prevents_the_next_request() {
-        let (url, request_received, server) = delayed_mock_server(
-            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            Duration::from_millis(200),
-        );
+        let response = http_response("200 OK", "Login and IP address notify OK.");
+        let (url, request_received, server) =
+            delayed_mock_server(response, Duration::from_millis(200));
         let stop_requested = Arc::new(AtomicBool::new(false));
         let config = Config {
             master_id: "mydns-test".to_string(),

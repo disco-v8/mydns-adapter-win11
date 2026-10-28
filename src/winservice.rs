@@ -9,6 +9,7 @@ use crate::logging::{log_error, log_info};
 use crate::notify::{
     NOTIFICATION_CYCLE_TIMEOUT, build_client, next_notification_at, notify_configs,
 };
+use crate::registry::Config;
 use crate::registry::load_all_configs;
 
 // --- 標準ライブラリ ---
@@ -33,6 +34,7 @@ use windows::Win32::System::Services::{
 use windows::core::HRESULT;
 // Windowsサービスの実装を簡略化するためのクレート。
 use windows_service::define_windows_service;
+use windows_service::service::ServiceAccess;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
@@ -40,6 +42,7 @@ use windows_service::service_control_handler::{
     self, ServiceControlHandlerResult, ServiceStatusHandle,
 };
 use windows_service::service_dispatcher;
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 /// Windowsサービスとして登録される際のサービス名。
 const SERVICE_NAME: &str = "MyDNSAdapterService";
@@ -48,6 +51,42 @@ const DELETE: u32 = 0x00010000;
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STOP_PENDING_WAIT_HINT: Duration = Duration::from_secs(20);
+
+fn validate_service_binary(command: &str, executable: &std::path::Path) -> std::io::Result<()> {
+    let executable = executable.to_string_lossy().replace('/', "\\");
+    let command = command.trim().replace('/', "\\");
+    let matches = ["--service", "-s"].iter().any(|argument| {
+        command.eq_ignore_ascii_case(&format!("\"{executable}\" {argument}"))
+            || (!executable.chars().any(char::is_whitespace)
+                && command.eq_ignore_ascii_case(&format!("{executable} {argument}")))
+    });
+    if matches {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{SERVICE_NAME} is registered to another executable or command line. No service was changed. Inspect 'sc.exe qc {SERVICE_NAME}' and manage it with its original application; do not uninstall it to replace it automatically. Current executable: {executable}"
+        )))
+    }
+}
+
+fn ensure_registered_binary_matches_current() -> Result<(), Box<dyn std::error::Error>> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => service,
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST.0 as i32) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let configuration = service.query_config()?;
+    validate_service_binary(
+        &configuration.executable_path.to_string_lossy(),
+        &std::env::current_exe()?,
+    )?;
+    Ok(())
+}
 
 /// サービスを開始するためのエントリーポイント。
 ///
@@ -167,14 +206,13 @@ fn run_service_loop_impl(_args: Vec<OsString>) -> windows_service::Result<()> {
         }
 
         let cycle_started = Instant::now();
-        match load_all_configs() {
-            Ok(configs) if configs.is_empty() => {
+        if let Err(error) = run_config_cycle(load_all_configs, |configs| {
+            if configs.is_empty() {
                 log_info(get_msg_en("log_service_config_missing"));
-            }
-            Ok(configs) => {
+            } else {
                 let report = notify_configs(
                     &client,
-                    &configs,
+                    configs,
                     true,
                     true,
                     cycle_started + NOTIFICATION_CYCLE_TIMEOUT,
@@ -190,9 +228,10 @@ fn run_service_loop_impl(_args: Vec<OsString>) -> windows_service::Result<()> {
                     log_error("Notification cycle reached its time limit.");
                 }
             }
-            Err(error) => log_error(&format!(
+        }) {
+            log_error(&format!(
                 "Failed to load notification configuration: {error}"
-            )),
+            ));
         }
 
         next_start_at = next_notification_at(cycle_started);
@@ -203,6 +242,19 @@ fn run_service_loop_impl(_args: Vec<OsString>) -> windows_service::Result<()> {
     // サービスの状態を「停止」としてOSに通知。
     status_handle.set_service_status(stopped_status())?;
 
+    Ok(())
+}
+
+fn run_config_cycle<Load, Process, Error>(
+    load_configs: Load,
+    process_configs: Process,
+) -> Result<(), Error>
+where
+    Load: FnOnce() -> Result<Vec<Config>, Error>,
+    Process: FnOnce(&[Config]),
+{
+    let configs = load_configs()?;
+    process_configs(&configs);
     Ok(())
 }
 
@@ -255,9 +307,13 @@ where
 mod tests {
     use super::{
         STOP_WAIT_POLL_INTERVAL, StopWaitDecision, handle_control_event, restart_after_stop,
-        should_send_stop_control, stop_pending_status, stop_wait_decision, stopped_status,
+        run_config_cycle, should_send_stop_control, stop_pending_status, stop_wait_decision,
+        stopped_status, validate_service_binary,
     };
+    use crate::registry::Config;
     use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -267,6 +323,39 @@ mod tests {
     use windows_service::service::ServiceControl;
     use windows_service::service::ServiceState;
     use windows_service::service_control_handler::ServiceControlHandlerResult;
+
+    #[test]
+    fn service_binary_accepts_quoted_path_and_legacy_service_argument() {
+        let executable = std::path::Path::new(r"C:\MyDNS Adapter\adapter.exe");
+        assert!(
+            validate_service_binary(r#""C:\MyDNS Adapter\adapter.exe" --service"#, executable)
+                .is_ok()
+        );
+        assert!(
+            validate_service_binary(r#""c:\mydns adapter\ADAPTER.exe" -s"#, executable).is_ok()
+        );
+        assert!(
+            validate_service_binary(
+                r"C:\MyDNS\adapter.exe --service",
+                std::path::Path::new(r"C:\MyDNS\adapter.exe")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn service_binary_rejects_other_executable_and_unexpected_arguments() {
+        let executable = std::path::Path::new(r"C:\MyDNS Adapter\adapter.exe");
+        for command in [
+            r#""C:\Other\other.exe" --service"#,
+            r#""C:\MyDNS Adapter\adapter.exe" --service --notify"#,
+            r"C:\MyDNS Adapter\adapter.exe --service",
+        ] {
+            let error = validate_service_binary(command, executable).unwrap_err();
+            assert!(error.to_string().contains("No service was changed"));
+            assert!(!error.to_string().contains("other.exe"));
+        }
+    }
 
     #[test]
     fn interrogate_does_not_request_shutdown() {
@@ -372,12 +461,73 @@ mod tests {
         assert_eq!(result, Err("stop failed"));
         assert!(!start_called);
     }
+
+    #[test]
+    fn each_service_cycle_uses_the_latest_settings_snapshot() {
+        let original = Config {
+            master_id: "mydns-existing".to_string(),
+            password: "old-password".to_string(),
+            ipv4_notify: true,
+            ipv6_notify: false,
+        };
+        let updated = Config {
+            master_id: "mydns-existing".to_string(),
+            password: "new-password".to_string(),
+            ipv4_notify: false,
+            ipv6_notify: true,
+        };
+        let added = Config {
+            master_id: "mydns-added".to_string(),
+            password: "added-password".to_string(),
+            ipv4_notify: true,
+            ipv6_notify: true,
+        };
+        let snapshots = RefCell::new(VecDeque::from([
+            vec![original],
+            vec![updated.clone(), added],
+            vec![updated],
+            vec![],
+        ]));
+        let observed = RefCell::new(Vec::<Vec<Config>>::new());
+
+        for _ in 0..4 {
+            run_config_cycle(
+                || snapshots.borrow_mut().pop_front().ok_or("no snapshot"),
+                |configs| observed.borrow_mut().push(configs.to_vec()),
+            )
+            .unwrap();
+        }
+
+        let observed = observed.into_inner();
+        assert_eq!(observed[0].len(), 1);
+        assert_eq!(observed[0][0].password, "old-password");
+        assert_eq!(observed[1].len(), 2);
+        assert_eq!(observed[1][0].password, "new-password");
+        assert!(!observed[1][0].ipv4_notify);
+        assert!(observed[1][0].ipv6_notify);
+        assert_eq!(observed[2].len(), 1);
+        assert_eq!(observed[2][0].master_id, "mydns-existing");
+        assert!(observed[3].is_empty());
+    }
+
+    #[test]
+    fn registry_read_error_does_not_reuse_previous_cycle_settings() {
+        let processed = Cell::new(false);
+        let result = run_config_cycle(
+            || Err::<Vec<Config>, _>("access denied"),
+            |_| processed.set(true),
+        );
+
+        assert_eq!(result, Err("access denied"));
+        assert!(!processed.get());
+    }
 }
 
 /// サービスをWindowsにインストールし、開始する。
 ///
 /// 管理者権限が必要です。
 pub fn install_service() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_registered_binary_matches_current()?;
     // 管理者権限があるかチェックする。
     if !is_elevated() {
         return Err(get_msg("admin_required_install").into());
@@ -435,6 +585,7 @@ pub fn install_service() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// 管理者権限が必要です。
 pub fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_registered_binary_matches_current()?;
     // 管理者権限があるかチェックする。
     if !is_elevated() {
         return Err(get_msg("admin_required_uninstall").into());
@@ -487,6 +638,7 @@ pub fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// 管理者権限が必要です。
 pub fn restart_service() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_registered_binary_matches_current()?;
     if !is_elevated() {
         return Err(get_msg("admin_required_restart").into());
     }

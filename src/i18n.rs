@@ -77,7 +77,7 @@ fn get_msg_lang(key: &str, is_jp: bool) -> &str {
         "no_accounts_add_prompt" => if is_jp { "アカウントが見つかりません。新規作成しますか？" } else { "No accounts found. Create new?" },
         "operation_cancelled" => if is_jp { "操作をキャンセルしました。" } else { "Operation cancelled." },
         "edit_target_fmt" => if is_jp { "対象アカウント: {}" } else { "Target Account: {}" },
-        "invalid_master_id_prefix" => if is_jp { "MasterIDは 'mydns' で始まる必要があります。" } else { "MasterID must start with 'mydns'." },
+        "invalid_master_id_prefix" => if is_jp { "MasterIDは 'mydns' に続けて半角数字6桁を入力してください。" } else { "MasterID must be 'mydns' followed by six ASCII digits." },
 
         // winservice.rs
         "admin_required_install" => if is_jp { "サービスのインストールには管理者権限が必要です。管理者として実行してください。" } else { "Administrator privileges are required to install the service. Please run as administrator." },
